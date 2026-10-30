@@ -35,8 +35,22 @@ def srt_time(sec):
 def run(cmd):
     p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
     if p.returncode: raise RuntimeError(p.stderr[-3000:])
+    return p.stdout
+
+def media_duration(path:Path)->float:
+    try:
+        out=run(["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(path)])
+        return max(0.0,float(out.strip()))
+    except Exception:
+        return 0.0
+
+def has_audio(path:Path)->bool:
+    try:
+        return bool(run(["ffprobe","-v","error","-select_streams","a:0","-show_entries","stream=index","-of","csv=p=0",str(path)]).strip())
+    except Exception:
+        return False
 @app.get("/health")
-def health(): return {"ok":True,"ffmpeg":bool(shutil.which("ffmpeg")),"model":MODEL}
+def health(): return {"ok":True,"ffmpeg":bool(shutil.which("ffmpeg")),"ffprobe":bool(shutil.which("ffprobe")),"model":MODEL}
 @app.post("/transcribe")
 async def transcribe(video:UploadFile=File(...)):
     ensure_ffmpeg()
@@ -77,44 +91,54 @@ async def render(video:UploadFile=File(...),segments:str=Form(...),voice:str=For
     ensure_ffmpeg()
     try: rows=json.loads(segments)
     except Exception: raise HTTPException(400,"รูปแบบ segments ไม่ถูกต้อง")
-    if not rows or any(not str(x.get("thai","")).strip() for x in rows): raise HTTPException(400,"มีช่วงที่ยังไม่มีบทพากย์ภาษาไทย")
+    if not isinstance(rows,list) or not rows or any(not str(x.get("thai","")).strip() for x in rows): raise HTTPException(400,"มีช่วงที่ยังไม่มีบทพากย์ภาษาไทย")
     allowed={"th-TH-PremwadeeNeural","th-TH-NiwatNeural"}
     if voice not in allowed: raise HTTPException(400,"เสียงที่เลือกไม่รองรับ")
     speed=max(.8,min(1.2,float(speed)))
-    td=tempfile.TemporaryDirectory(); root=Path(td.name); source=root/("input"+Path(video.filename or "video.mp4").suffix); await save_upload(video,source)
+    td=tempfile.TemporaryDirectory(); root=Path(td.name); suffix=Path(video.filename or "video.mp4").suffix.lower()
+    if suffix not in {".mp4",".mov",".m4v",".webm",".mkv",".avi"}: suffix=".mp4"
+    source=root/("input"+suffix)
     try:
-        # Build one timed Thai audio track by delaying each spoken segment to its transcription timestamp.
+        await save_upload(video,source)
+        duration=media_duration(source)
+        if duration<=0: raise HTTPException(400,"อ่านความยาววิดีโอไม่ได้ หรือไฟล์วิดีโอไม่ถูกต้อง")
+        original_has_audio=has_audio(source)
         inputs=[]; filters=[]
         for i,row in enumerate(rows):
             text=str(row.get("thai","")).strip()
+            start=max(0.0,float(row.get("start",0)))
+            if start>=duration: continue
             audio=root/f"seg{i}.mp3"
             rate=f"{int((speed-1)*100):+d}%"
-            communicate=edge_tts.Communicate(text,voice,rate=rate)
-            await communicate.save(str(audio))
+            await edge_tts.Communicate(text,voice,rate=rate).save(str(audio))
+            input_index=len(inputs)//2
             inputs += ["-i",str(audio)]
-            delay=max(0,int(float(row.get("start",0))*1000))
-            filters.append(f"[{i}:a]adelay={delay}|{delay},volume=1.0[a{i}]")
-        mix="".join(f"[a{i}]" for i in range(len(rows)))
-        filters.append(f"{mix}amix=inputs={len(rows)}:duration=longest:normalize=0,alimiter=limit=0.95[dub]")
+            delay=max(0,int(start*1000))
+            filters.append(f"[{input_index}:a]adelay={delay}|{delay},volume=1.0[a{input_index}]")
+        if not inputs: raise HTTPException(400,"ไม่มีช่วงบทพากย์ที่อยู่ในความยาววิดีโอ")
+        audio_count=len(inputs)//2
+        mix="".join(f"[a{i}]" for i in range(audio_count))
+        # Pad the dubbed track to the original video's duration so short speech never truncates the video.
+        filters.append(f"{mix}amix=inputs={audio_count}:duration=longest:normalize=0,apad,atrim=duration={duration:.3f},alimiter=limit=0.95[dub]")
         dubbed=root/"dub.wav"
-        run(["ffmpeg","-y",*inputs,"-filter_complex",";".join(filters),"-map","[dub]","-ac","2",str(dubbed)])
+        run(["ffmpeg","-y",*inputs,"-filter_complex",";".join(filters),"-map","[dub]","-ac","2","-ar","44100",str(dubbed)])
         srt=root/"thai.srt"
-        srt.write_text("\n\n".join(f"{i+1}\n{srt_time(float(x['start']))} --> {srt_time(float(x['end']))}\n{x['thai']}" for i,x in enumerate(rows))+"\n",encoding="utf-8-sig")
+        srt_rows=[]
+        for i,x in enumerate(rows):
+            a=max(0,min(duration,float(x.get("start",0)))); b=max(a,min(duration,float(x.get("end",a+1))))
+            if b>a: srt_rows.append(f"{len(srt_rows)+1}\n{srt_time(a)} --> {srt_time(b)}\n{str(x.get('thai','')).strip()}")
+        srt.write_text("\n\n".join(srt_rows)+"\n",encoding="utf-8-sig")
         output=root/"thai-dub-final.mp4"
-        # Keep the original clip's full duration and optionally retain original sound quietly under the dub.
-        if keep_original_audio:
-            af="[0:a]volume=0.16[orig];[1:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=longest:normalize=0[aout]"
-            cmd=["ffmpeg","-y","-i",str(source),"-i",str(dubbed),"-filter_complex",af,"-map","0:v:0","-map","[aout]","-c:v","libx264","-preset","veryfast","-crf","23","-c:a","aac","-shortest"]
+        if keep_original_audio and original_has_audio:
+            af="[0:a]volume=0.16[orig];[1:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=longest:normalize=0,apad,atrim=duration="+f"{duration:.3f}"+"[aout]"
+            cmd=["ffmpeg","-y","-i",str(source),"-i",str(dubbed),"-filter_complex",af,"-map","0:v:0","-map","[aout]","-c:v","libx264","-preset","veryfast","-crf","23","-c:a","aac","-t",f"{duration:.3f}"]
         else:
-            cmd=["ffmpeg","-y","-i",str(source),"-i",str(dubbed),"-map","0:v:0","-map","1:a:0","-c:v","libx264","-preset","veryfast","-crf","23","-c:a","aac","-shortest"]
+            cmd=["ffmpeg","-y","-i",str(source),"-i",str(dubbed),"-map","0:v:0","-map","1:a:0","-c:v","libx264","-preset","veryfast","-crf","23","-c:a","aac","-t",f"{duration:.3f}"]
         if burn_subtitles:
-            # Escape path for ffmpeg subtitles filter.
             sp=str(srt).replace("\\","/").replace(":","\\:").replace("'","\\'")
-            cmd += ["-vf",f"subtitles='{sp}':force_style='FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,BackColour=&H80000000,BorderStyle=3,Outline=1,Shadow=0,Alignment=2,MarginV=28'"]
+            cmd += ["-vf",f"subtitles='{sp}':force_style='FontName=Noto Sans Thai,FontSize=18,PrimaryColour=&H00FFFFFF,BackColour=&H80000000,BorderStyle=3,Outline=1,Shadow=0,Alignment=2,MarginV=28'"]
         cmd += [str(output)]
-        try: run(cmd)
-        except Exception as e: raise HTTPException(500,f"รวมวิดีโอไม่สำเร็จ ตรวจสอบ FFmpeg และฟอนต์ซับไทยบน Worker: {e}")
-        # Copy result out before temp cleanup using FileResponse background cleanup.
+        run(cmd)
         from starlette.background import BackgroundTask
         return FileResponse(output,media_type="video/mp4",filename="thai-dub-final.mp4",background=BackgroundTask(td.cleanup))
     except HTTPException:
